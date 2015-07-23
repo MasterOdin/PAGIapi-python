@@ -1,13 +1,16 @@
 """
 Python PAGIworld API
 """
+__author__ = "Matthew Peveler"
+__copyright__ = "Copyright 2015, RAIR Lab"
+__credits__ = ["Matthew Peveler"]
+__license__ = "MIT"
 
 import math
 import os
 import socket
 import time
 
-# TODO: finish adding in valid sensors and forces
 VALID_COMMANDS = ["sensorRequest", "addForce", "loadTask", "print", "findObj", "setState",
                   "getActiveStates", "setReflex", "removeReflex", "getActiveReflexes"]
 
@@ -22,17 +25,20 @@ for i in range(0, 3020, 15):
 #    VALID_SENSORS.append("P%f" % i)
 
 VALID_FORCES = ["RHvec", "LHvec", "BMvec", "RHH", "LHH", "RHV", "LHV", "BMH", "BMV", "J", "BR",
-                "RHG", "LHG"]
+                "RHG", "LHG", "RHR", "LHR"]
 
+# pylint: disable=too-many-instance-attributes
 class PAGIWorld(object):
     """
     :type pagi_socket: socket.socket
+    :type __ip_address: str
+    :type __port: int
+    :type __timeout: float
     :type __message_fragment: str
     :type __task_file: str
-    :type __command_stack: list
     :type message_stack: list
     """
-    def __init__(self, ip_address="", port=42209):
+    def __init__(self, ip_address="", port=42209, timeout=2):
         """
 
         :param ip:
@@ -40,14 +46,16 @@ class PAGIWorld(object):
         :return:
         """
         self.pagi_socket = None
+        self.__ip_address = ip_address
+        self.__port = port
+        self.__timeout = timeout
         self.__message_fragment = ""
         self.__task_file = ""
-        self.__command_stack = list()
         self.message_stack = list()
         self.connect(ip_address, port)
         self.agent = PAGIAgent(self)
 
-    def connect(self, ip_address="", port=42209):
+    def connect(self, ip_address="", port=42209, timeout=2):
         """
         Create a socket to the given
 
@@ -58,9 +66,16 @@ class PAGIWorld(object):
         """
         if ip_address == "":
             ip_address = socket.gethostbyname(socket.gethostname())
+        self.__ip_address = ip_address
+        self.__port = port
+        self.__timeout = timeout
+        self.__message_fragment = ""
+        self.__task_file = ""
+        self.message_stack = list()
         self.pagi_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.pagi_socket.connect((ip_address, port))
-        self.pagi_socket.setblocking(True)
+        self.pagi_socket.setblocking(False)
+        self.pagi_socket.settimeout(timeout)
 
     def disconnect(self):
         """
@@ -70,26 +85,26 @@ class PAGIWorld(object):
         :return:
         """
         self.pagi_socket.close()
-        self.pagi_socket = None
-        self.__message_fragment = ""
-        self.__command_stack = list()
-        self.message_stack = list()
 
     def __assert_open_socket(self):
         """
-        Make sure we are operating on an existing socket connection
+        Make sure that we have an existing socket connection. If we don't, exception will be raised.
         :return:
+        :raises: RuntimeError
         """
         if self.pagi_socket is None:
             raise RuntimeError("No open socket. Use connect() to open a new socket connection")
 
     def send_message(self, message):
         """
-        Send a message to the socket
+        Send a message to the socket. We make sure that the message is a valid action type, as well
+        verify that if the message is for a sensor or action, that it's a valid sensor or action
+        to prevent bad calls.
 
         :param message:
         :type message: str
         :return:
+        :raises: RuntimeError
         """
         self.__assert_open_socket()
         command = message[:message.find(",")]
@@ -109,39 +124,66 @@ class PAGIWorld(object):
         # all messages must end with \n
         if message[-1] != "\n":
             message += "\n"
-        self.__command_stack.append([command, secondary])
         self.pagi_socket.send(message.encode())
 
-    def get_message(self, code="", block=True):
+    def get_message(self, code="", block=False):
         """
-        Returns the first available message from the socket. By default will block till we get a
-        whole response from the socket
+        Gets messages from the socket. If code is blank, then we just return the first message
+        from the socket, otherwise return the first matching message with that code, saving all
+        other messages to a stack. If block is set to False, and there's no response from the
+        socket, after self.__timeout seconds, function will raise socket.timeout exception. If
+        block is set to true, no exception will be thrown, but program will stop in this function
+        if socket doesn't return anything
 
         :param code:
         :type code: str
         :param block:
         :type block: bool
         :return:
-        :raises: BlockingIOError
+        :raises: socket.timeout
         """
-        while True:
-            if block:
-                while "\n" not in self.__message_fragment:
-                    self.__message_fragment += self.pagi_socket.recv(4096).decode()
-            else:
+        if block:
+            self.pagi_socket.setblocking(True)
+        response = self.__get_message_from_stack()
+        while True and response != "":
+            while "\n" not in self.__message_fragment:
                 self.__message_fragment += self.pagi_socket.recv(4096).decode()
             message_index = self.__message_fragment.find("\n")
             if message_index == -1:
-                return ""
+                break
             else:
                 response = self.__message_fragment[:message_index]
                 self.__message_fragment = self.__message_fragment[message_index+1:]
                 if code == "" or (response[:len(code)] == code and response[len(code)] == ","):
-                    return response
+                    break
+                else:
+                    self.message_stack.append(response)
+        if block:
+            self.pagi_socket.setblocking(False)
+            self.pagi_socket.settimeout(self.__timeout)
+        return response
+
+    def __get_message_from_stack(self, code):
+        """
+        Attempts to return a message from the stack if (1) the stack isn't empty and (2) either
+        code is blank or it matches something on the message stack
+        :param code:
+        :return: str 
+        """
+        if len(self.message_stack) > 0:
+            if code != "":
+                for index in range(len(self.message_stack)):
+                    if self.message_stack[index][:len(code)] == code and \
+                            self.message_stack[index][len(code)] == ",":
+                        return self.message_stack.pop(0)
+                return None
+            else:
+                return self.message_stack.pop(0)
 
     def load_task(self, task_file):
         """
-
+        Loads a task in PAGIworld. We additionally save the task file name so we can reset things
+        if necessary
         :param task_file:
         :type task_file: str
         :raises: FileNotFoundError
@@ -153,7 +195,8 @@ class PAGIWorld(object):
 
     def reset_task(self):
         """
-
+        Resets the task to the one that was loaded in self.load_task. If one wasn't loaded, then
+        a RuntimeError will be raised.
         :raises: RuntimeError
         """
         if self.__task_file == "" or self.__task_file is None:
@@ -162,7 +205,7 @@ class PAGIWorld(object):
 
     def print_text(self, text):
         """
-
+        Print text to the PAGIworld console window.
         :param text:
         :type text: str
         :return:
@@ -173,16 +216,20 @@ class PAGIWorld(object):
 
     def set_state(self, name, length):
         """
-
+        Set a state within PAGIworld.
         :param name:
+        :type name: str
         :param length:
+        :type length: int
         :return:
         """
-        raise NotImplementedError
+        self.send_message("setState,%s,%d" % (name, length))
+        self.get_message(code="setState")
 
     def remove_state(self, name):
         """
-
+        "Removes" states from PAGIworld by just setting it's duration to zero (so that can't ever
+        really be in a state)
         :param name:
         :return:
         """
@@ -191,26 +238,30 @@ class PAGIWorld(object):
 
     def get_all_states(self):
         """
-
-        :return:
+        Returns a list of all states that are currently in PAGIworld.
+        :return: list
         """
         self.send_message("getActiveStates")
         states = self.get_message(code="activeStates").split(",")
         return states[1:]
 
-    def set_reflex(self, name, conditions, actions=""):
+    def set_reflex(self, name, conditions, actions=None):
         """
-
+        Sets a reflex in PAGIworld to be carried out on conditions.
         :param name:
         :param conditions:
         :param actions:
         :return:
         """
-        raise NotImplementedError
+        if actions is not None:
+            self.send_message("setReflex,%s,%s,%s" % (name, conditions, actions))
+        else:
+            self.send_message("setReflex,%s,%s" % (name, conditions))
+        self.get_message(code="setReflex")
 
     def remove_reflex(self, name):
         """
-
+        Removes a reflex completely from PAGIworld
         :param name:
         :return:
         """
@@ -219,19 +270,51 @@ class PAGIWorld(object):
 
     def get_all_reflexes(self):
         """
-
-        :return:
+        Returns a list of all the active reflexes in PAGIworld
+        :return: list
         """
         self.send_message("getActiveReflexes")
         reflexes = self.get_message(code="activeReflexes").split(",")
         return reflexes[1:]
 
-    def create_item(self):
+    def drop_item(self, name, x_coord, y_coord, description=None):
         """
-
+        Creates an item and drops into into PAGIworld. These items are the ones pre-built into
+        PAGIworld.
+        :param name:
+        :param x:
+        :param y:
+        :param n:
         :return:
         """
-        raise NotImplementedError
+        if description is None or description == "":
+            self.send_message("dropItem,%s,%f,%f" % (name, x_coord, y_coord))
+        else:
+            self.send_message("dropItem,%s,%f,%f,%s" % (name, x_coord, y_coord, description))
+        self.get_message(code="dropItem")
+
+    # pylint: disable=too-many-arguments
+    def create_item(self, name, image_file, x, y, m, ph, r, e, k, degrees=True):
+        """
+        Creates a new item in PAGIworld with the specified properties
+
+        :param name:
+        :param image_file:
+        :param x:
+        :param y:
+        :param m:
+        :param ph:
+        :param r:
+        :param e:
+        :param k:
+        :param degrees:
+        :return:
+        """
+        if degrees:
+            r = r * math.pi / 180.
+        self.send_message("createItem,%s,%s,%f,%f,%f,%d,%f,%f,%d" % (name, image_file,
+                                                                     x, y, m, ph, r, e, k))
+        self.get_message(code="createItem")
 
 class PAGIAgent(object):
     """
@@ -357,6 +440,7 @@ class PAGIAgent(object):
         if not absolute:
             self.pagi_world.send_message("addForce,BMvec%f,%f" % (x, y))
         else:
+            # TODO: Finish implementation of this
             rotation = self.get_rotation()
             if x != 0 and y != 0:
                 ax = math.fabs(x)
@@ -408,7 +492,8 @@ class PAGIAgent(object):
     @staticmethod
     def __process_vision(response, column_length):
         """
-
+        Internal method to process returned vision repsonse. Splits the response into a list of
+        lists where each inner list is the length of specified column_length.
         :param response:
         :param column_length:
         :return:
