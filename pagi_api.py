@@ -11,6 +11,8 @@ import os
 import socket
 import time
 
+ERROR_CHECK = True
+
 VALID_COMMANDS = ["sensorRequest", "addForce", "loadTask", "print", "findObj", "setState",
                   "getActiveStates", "setReflex", "removeReflex", "getActiveReflexes"]
 
@@ -18,11 +20,12 @@ VALID_SENSORS = ["S", "BP", "LP", "RP", "A", "MDN", "MPN"]
 for i in range(5):
     VALID_SENSORS.append("L%d" % i)
     VALID_SENSORS.append("R%d" % i)
-for i in range(0, 3020, 15):
-    VALID_SENSORS.append("V%f" % (i / 100.))
-# TODO: Ask John what are valid numbers for this
-# for i in range(0, 15.10, 0.667):
-#    VALID_SENSORS.append("P%f" % i)
+for i in range(0, 31):
+    for j in range(0, 21):
+        VALID_SENSORS.append("V%d.%d" % (i, j))
+for i in range(0, 16):
+    for j in range(0, 11):
+        VALID_SENSORS.append("P%d.%d" % (i, j))
 
 VALID_FORCES = ["RHvec", "LHvec", "BMvec", "RHH", "LHH", "RHV", "LHV", "BMH", "BMV", "J", "BR",
                 "RHG", "LHG", "RHR", "LHR"]
@@ -38,7 +41,7 @@ class PAGIWorld(object):
     :type __task_file: str
     :type message_stack: list
     """
-    def __init__(self, ip_address="", port=42209, timeout=2):
+    def __init__(self, ip_address="", port=42209, timeout=3):
         """
 
         :param ip:
@@ -52,10 +55,10 @@ class PAGIWorld(object):
         self.__message_fragment = ""
         self.__task_file = ""
         self.message_stack = list()
-        self.connect(ip_address, port)
+        self.connect(ip_address, port, timeout)
         self.agent = PAGIAgent(self)
 
-    def connect(self, ip_address="", port=42209, timeout=2):
+    def connect(self, ip_address="", port=42209, timeout=3):
         """
         Create a socket to the given
 
@@ -107,19 +110,20 @@ class PAGIWorld(object):
         :raises: RuntimeError
         """
         self.__assert_open_socket()
-        command = message[:message.find(",")]
-        if command == "" or command not in VALID_COMMANDS:
-            raise RuntimeError("Invalid command found in the message '%s'" % message)
+        if ERROR_CHECK:
+            command = message[:message.find(",")]
+            if command == "" or command not in VALID_COMMANDS:
+                raise RuntimeError("Invalid command found in the message '%s'" % message)
 
-        end = message[len(command)+1:].find(",")
-        if end == -1:
-            secondary = message[len(command)+1:]
-        else:
-            secondary = message[len(command)+1:end]
-        if command == "sensorRequest" and secondary not in VALID_SENSORS:
-            raise RuntimeError("Invalid sensor '%s' in message '%s'" % (secondary, message))
-        elif command == "addForce" and secondary not in VALID_FORCES:
-            raise RuntimeError("Invalid force '%s' in message '%s'" % (secondary, message))
+            end = message[len(command)+1:].find(",")
+            if end == -1:
+                secondary = message[len(command)+1:]
+            else:
+                secondary = message[len(command)+1:end + len(command) + 1]
+            if command == "sensorRequest" and secondary not in VALID_SENSORS:
+                raise RuntimeError("Invalid sensor '%s' in message '%s'" % (secondary, message))
+            elif command == "addForce" and secondary not in VALID_FORCES:
+                raise RuntimeError("Invalid force '%s' in message '%s'" % (secondary, message))
 
         # all messages must end with \n
         if message[-1] != "\n":
@@ -144,7 +148,7 @@ class PAGIWorld(object):
         """
         if block:
             self.pagi_socket.setblocking(True)
-        response = self.__get_message_from_stack()
+        response = self.__get_message_from_stack(code)
         while True and response != "":
             while "\n" not in self.__message_fragment:
                 self.__message_fragment += self.pagi_socket.recv(4096).decode()
@@ -168,7 +172,7 @@ class PAGIWorld(object):
         Attempts to return a message from the stack if (1) the stack isn't empty and (2) either
         code is blank or it matches something on the message stack
         :param code:
-        :return: str 
+        :return: str
         """
         if len(self.message_stack) > 0:
             if code != "":
@@ -396,11 +400,11 @@ class PAGIAgent(object):
         :return:
         """
         self.pagi_world.send_message("sensorRequest,A")
-        response = self.pagi_world.get_message(code="BR").split(",")
-        rotation = float(response)
+        response = self.pagi_world.get_message(code="A").split(",")
+        rotation = float(response[-1])
         rotation %= 360
-        if not degrees:
-            rotation = rotation * math.pi / 180
+        if degrees:
+            rotation = rotation * 180 / math.pi
         return rotation
 
     def move_paces(self, paces, direction='L'):
@@ -437,10 +441,11 @@ class PAGIAgent(object):
         :type absolute: bool
         :return:
         """
-        if not absolute:
-            self.pagi_world.send_message("addForce,BMvec%f,%f" % (x, y))
+        x = float(x)
+        y = float(y)
+        if not absolute or (x == 0 and y == 0):
+            self.pagi_world.send_message("addForce,BMvec,%f,%f" % (x, y))
         else:
-            # TODO: Finish implementation of this
             rotation = self.get_rotation()
             if x != 0 and y != 0:
                 ax = math.fabs(x)
@@ -449,16 +454,86 @@ class PAGIAgent(object):
                 angle = math.acos(ay / hyp)
                 z = math.sin(angle) * ay
             else:
-                if x > 0:
-                    pass
-                elif x < 0:
-                    pass
-                elif y < 0:
-                    pass
+                if x != 0:
+                    z = math.fabs(x)
                 else:
-                    pass
+                    z = math.fabs(y)
+            nx, ny = PAGIAgent.__get_relative_vector(x, y, z, rotation)
+            print(nx, ny)
+            self.pagi_world.send_message("addForce,BMvec,%f,%f" % (nx, ny))
 
         self.pagi_world.get_message(code="BMvec")
+
+    @staticmethod
+    def __get_relative_vector(x, y, z, rotation):
+        """
+        TODO: Finish and simplify
+
+        :param x:
+        :param y:
+        :param z:
+        :param rotation:
+        :return:
+        """
+        if x == 0:
+            if y < 0:
+                angle = 180
+            else:
+                angle = 0
+        elif y == 0:
+            if x > 0:
+                angle = 270
+            else:
+                angle = 90
+        elif x < 0:
+            if y > 0:
+                angle = math.acos(z / y) * 180 / math.pi
+            else:
+                angle = math.acos(z / x) * 180 / math.pi + 90
+        else:
+            if y < 0:
+                angle = math.acos(z / y) * 180 / math.pi + 180
+            else:
+                angle = math.acos(z / x) * 180 / math.pi + 270
+
+        adjusted = rotation - angle
+        radjusted = adjusted * math.pi / 180
+        if adjusted == 0:
+            return 0, z
+        elif adjusted == 180 or adjusted == -180:
+            return 0, (-1 * z)
+        elif adjusted == 90 or adjusted == -270:
+            return z, 0
+        elif adjusted == 270 or adjusted == -90:
+            return (-1 * z), 0
+        else:
+            if adjusted > 0:
+                if adjusted < 90:
+                    ny = math.cos(radjusted) * z
+                    nx = math.sqrt(math.pow(z, 2) - math.pow(ny, 2))
+                elif adjusted < 180:
+                    nx = math.cos(radjusted - 90) * z
+                    ny = math.sqrt(math.pow(z, 2) - math.pow(nx, 2)) * -1
+                elif adjusted < 270:
+                    ny = math.cos(radjusted - 180) * z * -1
+                    nx = math.sqrt(math.pow(z, 2) - math.pow(ny, 2)) * -1
+                else:
+                    nx = math.cos(radjusted - 270) * z * -1
+                    ny = math.sqrt(math.pow(z, 2) - math.pow(nx, 2))
+            else:
+                if adjusted < -90:
+                    ny = math.cos(radjusted * -1) * z
+                    nx = math.sqrt(math.pow(z, 2) - math.pow(ny, 2)) * -1
+                elif adjusted < -180:
+                    nx = math.cos(radjusted * -1 - 90) * z * -1
+                    ny = math.sqrt(math.pow(z, 2) - math.pow(nx, 2)) * -1
+                elif adjusted < -270:
+                    ny = math.cos(radjusted * -1 - 180) * z * -1
+                    nx = math.sqrt(math.pow(z, 2) - math.pow(ny, 2))
+                else:
+                    nx = math.cos(radjusted * -1 - 270) * z
+                    ny = math.sqrt(math.pow(z, 2) - math.pow(nx, 2))
+            return nx, ny
 
     def get_position(self):
         """
